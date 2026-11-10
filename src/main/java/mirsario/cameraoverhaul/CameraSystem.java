@@ -122,7 +122,7 @@ public final class CameraSystem {
 		double decaySmoothing = BASE_TURNING_ROLL_SMOOTHING * cfg.general.turningRollSmoothing;
 		double intensity = BASE_TURNING_ROLL_INTENSITY * cfg.general.turningRollIntensity;
 		double accumulation = BASE_TURNING_ROLL_ACCUMULATION * cfg.general.turningRollAccumulation;
-		double yawDelta = prevCameraEulerRot.y - context.transform.eulerRot.y;
+		double yawDelta = MathUtils.unwrapStep(prevCameraEulerRot.y - context.transform.eulerRot.y);
 
 		// Don't spazz out when switching perspectives.
 		if (context.perspective != prevCameraPerspective) yawDelta = 0.0;
