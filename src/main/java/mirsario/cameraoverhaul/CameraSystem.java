@@ -8,6 +8,9 @@ import mirsario.cameraoverhaul.configuration.*;
 import mirsario.cameraoverhaul.utilities.*;
 import org.joml.SimplexNoise;
 import org.joml.Vector3d;
+import java.io.*;
+import java.nio.file.*;
+import java.util.UUID;
 
 @SuppressWarnings("unused")
 public final class CameraSystem {
@@ -118,22 +121,180 @@ public final class CameraSystem {
 	private static final double BASE_TURNING_ROLL_SMOOTHING = 0.0825;
 	private double turningRollTargetOffset;
 
+	// === Diagnostic trial fields ===
+	// Build identity — change when diagnostics are revised under the same trial
+	private static final String BUILD_REVISION = "r3";
+	private static final String TRIAL_ID = "co-yaw-trial-20261109-r1";
+	private static final String SOURCE_COMMIT = "51bae6f73d4b5efe9e27ed64df5445828e71a6b6";
+	private static final String CANDIDATE_MODE = "normalized-yaw-step";
+	private static final String CANDIDATE_VERSION = TRIAL_ID + "-" + BUILD_REVISION;
+	private static final long MAX_DIAG_BYTES = 2L * 1024L * 1024L; // hard cap on file bytes
+	private static final long DIAG_FLUSH_INTERVAL_MS = 2000L;
+	private static final double DIAG_SAMPLE_INTERVAL = 0.1; // 10 Hz
+	private static final int DIAG_TERMINAL_RESERVE = 256; // bytes reserved for terminal record
+
+	private StringBuilder diagBuf;
+	private Path diagPath;
+	private long diagBytes;
+	private long diagLastFlushMs;
+	private long diagSeq;
+	private double diagLastSampleTime;
+	private String diagSessionId;
+	private boolean diagEnabled;
+	private boolean diagFailed;
+	private boolean diagTruncated;
+	private boolean diagTerminalWritten;
+
+	private void diagInit() {
+		if (diagEnabled || diagFailed || diagTruncated) return;
+		diagSessionId = UUID.randomUUID().toString().substring(0, 8);
+		try {
+			// Resolve game logs directory via FabricLoader
+			Class<?> fcl = Class.forName("net.fabricmc.loader.api.FabricLoader");
+			Object inst = fcl.getMethod("getInstance").invoke(null);
+			Path gameDir = (Path) fcl.getMethod("getGameDir").invoke(inst);
+			diagPath = gameDir.resolve("logs").resolve("cameraoverhaul-yaw-trial-" + diagSessionId + ".csv");
+		} catch (Exception e) {
+			CameraOverhaul.LOGGER.error("Trial diagnostic: cannot resolve game logs dir, disabled: {}", e.getMessage());
+			diagFailed = true;
+			return;
+		}
+		try {
+			Files.createDirectories(diagPath.getParent());
+		} catch (Exception e) {
+			CameraOverhaul.LOGGER.error("Trial diagnostic: cannot create logs dir, disabled: {}", e.getMessage());
+			diagFailed = true;
+			return;
+		}
+		try {
+			diagBuf = new StringBuilder();
+			diagBuf.append("schema,1.0\n");
+			diagBuf.append("trial_id,").append(TRIAL_ID).append("\n");
+			diagBuf.append("source_commit,").append(SOURCE_COMMIT).append("\n");
+			diagBuf.append("candidate_mode,").append(CANDIDATE_MODE).append("\n");
+			diagBuf.append("candidate_version,").append(CANDIDATE_VERSION).append("\n");
+			diagBuf.append("session_id,").append(diagSessionId).append("\n");
+			diagBuf.append("# Columns: seq,time_ms,prevPersp,currPersp,prevYaw,currYaw,rawDiff,normDiff,guardStatus,actualDiff,accumBefore,accumAfter,rollContrib,effectiveAccum,effectiveIntensity,effectiveDamping,deltaTime,wrapFlag\n");
+			diagBytes = diagBuf.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+			// Write header
+			Files.write(diagPath, diagBuf.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8), StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+			diagBuf = new StringBuilder();
+			diagLastSampleTime = TimeSystem.getTime();
+			diagLastFlushMs = System.currentTimeMillis();
+			diagEnabled = true;
+			// Register JVM shutdown hook for terminal record
+			Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+				diagEnabled = true; // allow terminal write
+				diagTryTerminate();
+			}));
+		} catch (Exception e) {
+			CameraOverhaul.LOGGER.error("Failed to init trial diagnostic: {}", e.getMessage());
+			diagFailed = true;
+		}
+	}
+
+	private void diagFlushNow() {
+		if (diagBuf == null || diagBuf.length() == 0) return;
+		try {
+			Files.write(diagPath, diagBuf.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8), StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+			diagBuf = new StringBuilder();
+			diagLastFlushMs = System.currentTimeMillis();
+		} catch (IOException e) {
+			CameraOverhaul.LOGGER.error("Trial diagnostic flush failed: {}", e.getMessage());
+			diagFailed = true;
+			diagEnabled = false;
+		}
+	}
+
+	private void diagWrite(String line) {
+		if (!diagEnabled || diagFailed) return;
+		// Pre-check: reserve space for terminal record
+		long lineBytes = line.getBytes(java.nio.charset.StandardCharsets.UTF_8).length + 1;
+		if (diagBytes + lineBytes + DIAG_TERMINAL_RESERVE > MAX_DIAG_BYTES) {
+			diagBuf.append("#TRUNCATED,diag_bytes=").append(diagBytes).append("\n");
+			diagFlushNow();
+			CameraOverhaul.LOGGER.warn("Trial diagnostic capped at 2 MiB");
+			diagTruncated = true;
+			diagEnabled = false;
+			return;
+		}
+		diagBuf.append(line).append("\n");
+		diagBytes += lineBytes;
+	}
+
+	private void diagTryTerminate() {
+		if (diagTerminalWritten) return;
+		diagTerminalWritten = true;
+		if (diagBuf == null) return;
+		if (diagTruncated) {
+			diagBuf.append("#TRUNCATED_END,diag_bytes=").append(diagBytes).append("\n");
+		} else if (diagFailed) {
+			diagBuf.append("#END,failed_earlier\n");
+		} else {
+			diagBuf.append("#END,session_normal\n");
+		}
+		diagFlushNow();
+	}
+
 	private void turningRollOffset(CameraContext context, Transform outputTransform, double deltaTime) {
 		double decaySmoothing = BASE_TURNING_ROLL_SMOOTHING * cfg.general.turningRollSmoothing;
 		double intensity = BASE_TURNING_ROLL_INTENSITY * cfg.general.turningRollIntensity;
 		double accumulation = BASE_TURNING_ROLL_ACCUMULATION * cfg.general.turningRollAccumulation;
-		double yawDelta = MathUtils.unwrapStep(prevCameraEulerRot.y - context.transform.eulerRot.y);
+		double rawYawDelta = prevCameraEulerRot.y - context.transform.eulerRot.y;
+		double normDiff = MathUtils.unwrapStep(rawYawDelta);
 
 		// Don't spazz out when switching perspectives.
-		if (context.perspective != prevCameraPerspective) yawDelta = 0.0;
+		boolean guardActive = context.perspective != prevCameraPerspective;
+		double actualDiff = guardActive ? 0.0 : normDiff;
 
 		// Decay
+		double accumBefore = turningRollTargetOffset;
 		turningRollTargetOffset = MathUtils.damp(turningRollTargetOffset, 0, decaySmoothing, deltaTime);
 		// Accumulation
-		turningRollTargetOffset = MathUtils.clamp(turningRollTargetOffset + (yawDelta * accumulation), -1.0, 1.0);
+		turningRollTargetOffset = MathUtils.clamp(turningRollTargetOffset + (actualDiff * accumulation), -1.0, 1.0);
+		double accumAfter = turningRollTargetOffset;
 		// Apply
-		var turningRollOffset = MathUtils.clamp01(turningEasing(Math.abs(turningRollTargetOffset))) * intensity * Math.signum(turningRollTargetOffset);
-		outputTransform.eulerRot.z += turningRollOffset;
+		var turningRollContrib = MathUtils.clamp01(turningEasing(Math.abs(turningRollTargetOffset))) * intensity * Math.signum(turningRollTargetOffset);
+		outputTransform.eulerRot.z += turningRollContrib;
+
+		// Diagnostic recording — time-based 10 Hz sampling
+		diagInit();
+		diagSeq++;
+		if (!diagEnabled) {
+			diagTryTerminate();
+			return;
+		}
+		double nowT = TimeSystem.getTime();
+		boolean isWrapEvent = Math.abs(rawYawDelta) >= 180.0;
+		boolean isPerspectiveChange = guardActive;
+		boolean periodicDue = (nowT - diagLastSampleTime) >= DIAG_SAMPLE_INTERVAL;
+		// Retain all wrap-sized events and perspective transitions; sample periodically otherwise
+		if (isWrapEvent || isPerspectiveChange || periodicDue) {
+			diagLastSampleTime = nowT;
+			String line = diagSeq + ","
+				+ String.format("%.0f", nowT * 1000.0) + ","
+				+ prevCameraPerspective + ","
+				+ context.perspective + ","
+				+ String.format("%.4f", prevCameraEulerRot.y) + ","
+				+ String.format("%.4f", context.transform.eulerRot.y) + ","
+				+ String.format("%.6f", rawYawDelta) + ","
+				+ String.format("%.6f", normDiff) + ","
+				+ (guardActive ? "1" : "0") + ","
+				+ String.format("%.6f", actualDiff) + ","
+				+ String.format("%.6f", accumBefore) + ","
+				+ String.format("%.6f", accumAfter) + ","
+				+ String.format("%.6f", turningRollContrib) + ","
+				+ String.format("%.6f", accumulation) + ","
+				+ String.format("%.6f", intensity) + ","
+				+ String.format("%.6f", decaySmoothing) + ","
+				+ String.format("%.6f", deltaTime) + ","
+				+ (isWrapEvent ? "1" : "0");
+			diagWrite(line);
+			long msNow = System.currentTimeMillis();
+			if (msNow - diagLastFlushMs > DIAG_FLUSH_INTERVAL_MS) {
+				diagFlushNow();
+			}
+		}
 	}
 
 	private static double turningEasing(double x) {
